@@ -1,121 +1,130 @@
-import re
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 from googletrans import Translator
 import atexit
 from datetime import datetime
-import os
 import torch
 
 
-def start_end():
-    # 실행 시작 시간 출력
-    start_time = datetime.now()
-    print(f"실행 시작: {start_time}")
+class Backtranslator:
+    def __init__(self, input_file, output_file, model_name, entities_to_mask):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.input_file = input_file
+        self.output_file = output_file
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_name)
+        self.ner_pipeline = pipeline("ner", model=self.model, tokenizer=self.tokenizer,
+                                     device=0 if torch.cuda.is_available() else -1,ignore_labels=['0'])
+        self.translator = Translator()
+        self.entities_to_mask = entities_to_mask
 
-    # 종료 시 실행 종료 시간 출력
-    def log_end_time():
-        end_time = datetime.now()
-        print(f"실행 종료: {end_time}")
-        print(f"실행에 걸린 시간: {end_time - start_time}")
+    # 시작 시간, 끝나는 시간, 실행에 걸린 시간
+    def start_end(self):
+        # Log start time
+        start_time = datetime.now()
+        print(f"Execution started at: {start_time}")
 
-    atexit.register(log_end_time)
+        # Register atexit to log end time
+        def log_end_time():
+            end_time = datetime.now()
+            print(f"Execution ended at: {end_time}")
+            print(f"Total execution time: {end_time - start_time}")
 
-start_end()
+        atexit.register(log_end_time)
 
-# MPS 디바이스 설정
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-print(f"Using device: {device}")
+    def mask_named_entities_by_phrase(self, text):
+        entities = self.ner_pipeline(text)
+        placeholders = {}
+        # 어절 단위 분리
+        words = text.split()
+        masked_words = words.copy()
 
-# NER 모델 및 토크나이저 로드
-model_name = "Leo97/KoELECTRA-small-v3-modu-ner"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForTokenClassification.from_pretrained(model_name).to(device)
+        masked_indices = set()
+        special_postpositions = ['은','는','에게','이라고','을','를','이',
+                                 '가','의','에','과','와','로','으로','도',
+                                 '에서','만','이나','나','까지','부터','보다',
+                                 '께','처럼','이라도','라도','으로서','로서']
 
-# NER 파이프라인 설정
-ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer, device=0 if device == "mps" else -1)
+        for idx, entity in enumerate(entities):
+            if entity['entity'] in self.entities_to_mask:  # 마스킹할 엔터티 리스트에 있는 경우만 선택
+                token_start, token_end = entity.get('start', 0), entity.get('end', 0)
+                for i, word in enumerate(words):
+                    if i in masked_indices:
+                        continue
+                    word_start = text.find(word)
+                    word_end = word_start + len(word)
+                    # 어절 안에 보호할 태그가 있다면
+                    if word_start <= token_start < word_end:
+                        # 1단계: 어절에 특수기호가 포함되어 있고 '은'이나 '는'이 끝에 온다면 특수기호와 은,는 제외하고 마스킹
+                        if word[-1] in [',', '.', '!', '?'] and (word[-2:] == '은?' or word[-2:] == '는?'):
+                            mask = f"<@_{idx}>"
+                            masked_words[i] = mask + word[-2:]
+                            placeholders[mask] = word[:-2]
+                        # 2단계: 보호될 엔터티가 포함된 어절이 조사로 끝나지 않는다면 그대로 마스킹
+                        elif not any(word.endswith(post) for post in special_postpositions):
+                            mask = f"<@_{idx}>"
+                            masked_words[i] = mask
+                            placeholders[mask] = word
+                        # 3단계: 보호될 엔터티가 포함된 어절이 조사로 끝난다면 조사 복사 후 마스킹
+                        else:
+                            for post in special_postpositions:
+                                if word.endswith(post):
+                                    mask = f"<@_{idx}>"
+                                    masked_words[i] = mask + post
+                                    placeholders[mask] = word
+                                    break
+                        masked_indices.add(i)
+                        break
 
-# 번역기 설정
-translator = Translator()
+        masked_text = ' '.join(masked_words)
+        return masked_text, placeholders
 
-# 보호할 엔티티 태그 리스트
-protected_tags = {"B-AM"}
+    def restore_placeholders(self, text, placeholders):
+        # 마스킹 된 채로 모두 어절 단위로 분리
+        words = text.split()
+        restored_words = []
 
+        for word in words:
+            restored_word = word
+            for placeholder, original_text in placeholders.items():
+                if placeholder in word:
+                    # 마스크가 들어있는 어절 전체를 placeholder로 교체
+                    restored_word = original_text
+                    break
+            restored_words.append(restored_word)
 
-def mask_named_entities(text):
-    """NER로 인식한 고유명사를 태깅 형태로 마스킹하여 보호"""
-    entities = ner_pipeline(text)
-    placeholders = {}
-    masked_text = text
+        return ' '.join(restored_words)
 
-    # 고유명사에 태깅 이름 그대로 마스킹
-    offset = 0  # 마스킹으로 인한 인덱스 변화를 추적하는 변수
-    for entity in entities:
-        if entity['entity'] in protected_tags:
-            start, end = entity['start'] + offset, entity['end'] + offset
-            original_text = text[entity['start']:entity['end']]
+    def process_text(self):
+        with open(self.input_file, 'r', encoding='utf-8') as infile:
+            lines = infile.readlines()
 
-            # NER 태그명 그대로 마스킹 처리
-            mask = f"<{entity['entity']}_{len(placeholders)}>"
-            masked_text = masked_text[:start] + mask + masked_text[end:]
+        with open(self.output_file, 'w', encoding='utf-8') as outfile:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
 
-            # 오프셋을 업데이트하여 다음 인덱스 조정
-            offset += len(mask) - (end - start)
-            placeholders[mask] = original_text
+                masked_text, placeholders = self.mask_named_entities_by_phrase(line)
 
-    return masked_text, placeholders
+                translated_en = self.translator.translate(masked_text, src='ko', dest='ja').text
 
+                back_translated_ko = self.translator.translate(translated_en, src='ja', dest='ko').text
 
-def restore_placeholders(text, placeholders):
-    """마스킹한 플레이스홀더를 고유명사로 복원"""
-    for placeholder, original_text in placeholders.items():
-        # 정확히 일치하는 placeholder를 원래 텍스트로 대체
-        text = re.sub(re.escape(placeholder), original_text, text)
-    return text
+                restored_text = self.restore_placeholders(back_translated_ko, placeholders)
 
+                outfile.write(f"{restored_text}\n")
 
-# 파일 경로 설정
-input_file_path = os.path.expanduser("~/Desktop/J.Lee/PycharmProjects/pythonProject/test.txt")
-output_file_path = os.path.expanduser("~/Desktop/J.Lee/PycharmProjects/pythonProject/bt_test.txt")
-
-# txt 파일 처리
-def read_txt_file(file_path):
-    """txt 파일에서 텍스트 읽기"""
-    with open(file_path, "r", encoding="utf-8") as file:
-        return file.readlines()
+        print("Translation, correction, and post-editing complete. File saved.")
 
 
-def write_txt_file(file_path, lines):
-    """txt 파일로 텍스트 저장"""
-    with open(file_path, "w", encoding="utf-8") as file:
-        file.writelines(lines)
+if __name__ == "__main__":
+    input_file_path = '/home/danny/test/BT_augmentation/original_data/nia_model3.txt'
+    output_file_path = '/home/danny/test/BT_augmentation/paraphrased_data/nia_model3_trans.txt'
+    model_name = "monologg/koelectra-base-v3-naver-ner"
+    # "Leo97/KoELECTRA-small-v3-modu-ner"
+    entities_to_mask = ['ORG-B', 'PER-B', 'CVL-B']  # 마스킹할 엔터티 리스트 정의
+    # ["B-AM", "I-AM", "B-LC", "I-LC", "B-OG", "I-OG", "B-PT", "I-PT", "B-TM", "I-TM", "B-TI"]
 
-
-# txt 파일 읽기
-lines = read_txt_file(input_file_path)
-
-# 번역 및 파일 저장
-translated_lines = []
-for line in lines:
-    line = line.strip()
-    if not line:
-        continue
-
-    # 고유명사 마스킹
-    masked_text, placeholders = mask_named_entities(line)
-
-    # 1차 번역 (한국어 -> 영어)
-    translated_en = translator.translate(masked_text, src="ko", dest="en").text
-
-    # 2차 번역 (영어 -> 한국어)
-    back_translated_ko = translator.translate(translated_en, src="en", dest="ko").text
-
-    # 플레이스홀더 복원
-    final_text = restore_placeholders(back_translated_ko, placeholders)
-
-    # 번역 결과 저장
-    translated_lines.append(final_text + "\n")
-
-# 결과를 txt 파일로 저장
-write_txt_file(output_file_path, translated_lines)
-
-print("번역 및 파일 저장이 완료되었습니다.")
+    processor = Backtranslator(input_file=input_file_path, output_file=output_file_path, model_name=model_name, entities_to_mask=entities_to_mask)
+    processor.start_end()
+    processor.process_text()
