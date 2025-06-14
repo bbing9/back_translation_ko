@@ -118,8 +118,8 @@ class Backtranslator:
 
 
 if __name__ == "__main__":
-    input_file_path = '/home/danny/test/BT_augmentation/original_data/nia_model3.txt'
-    output_file_path = '/home/danny/test/BT_augmentation/paraphrased_data/nia_model3_trans.txt'
+    input_file_path = ''
+    output_file_path = ''
     model_name = "monologg/koelectra-base-v3-naver-ner"
     # "Leo97/KoELECTRA-small-v3-modu-ner"
     entities_to_mask = ['ORG-B', 'PER-B', 'CVL-B']  # 마스킹할 엔터티 리스트 정의
